@@ -23,12 +23,17 @@ static HHOOK            s_hHook       = NULL;
 static DWORD            s_threadId    = 0;
 static volatile bool    s_stopFlag    = false;
 
+/* ---- Inline key capture for remap UI ---- */
+static volatile HWND    s_captureHwnd = NULL;   /* window to notify */
+static volatile bool    s_captureMode = false;
+
 /* Bindings: protected by a critical section for atomic swap.
  * The hook callback reads a LOCAL COPY so the CS is not held during dispatch. */
 static CRITICAL_SECTION s_bindingsCS;
 static KeyBindings      s_bindings;
 static KeyBindings      s_bindingsLocal;  /* snapshot used in callback */
 static volatile bool    s_bindingsDirty = true;
+static volatile bool    s_swallowKeys   = false;  /* swallow bound keys when active */
 
 /* ---- Refresh the local snapshot if bindings changed ---- */
 static void RefreshBindingsSnapshot() {
@@ -68,6 +73,23 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam,
     }
 
     UINT vk = kb->vkCode;
+
+    /* ---- Inline key capture mode ---- */
+    if (s_captureMode && isDown) {
+        /* Skip pure modifiers — we want the actual key */
+        if (vk != VK_CONTROL && vk != VK_LCONTROL && vk != VK_RCONTROL &&
+            vk != VK_SHIFT   && vk != VK_LSHIFT   && vk != VK_RSHIFT   &&
+            vk != VK_MENU    && vk != VK_LMENU    && vk != VK_RMENU) {
+            /* Post the captured key to the UI window */
+            HWND hwnd = s_captureHwnd;
+            s_captureMode = false;
+            s_captureHwnd = NULL;
+            if (hwnd) {
+                PostMessage(hwnd, WM_APP + 10, (WPARAM)vk, 0);
+            }
+            return 1;  /* swallow the captured key */
+        }
+    }
 
     /* Refresh bindings snapshot if config changed */
     RefreshBindingsSnapshot();
@@ -120,9 +142,18 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam,
     else if (vk == b.precisionToggle) {
         s_state->precisionMode.store(isDown, std::memory_order_relaxed);
     }
+    else {
+        /* Key is NOT bound — always pass it through */
+        return CallNextHookEx(s_hHook, nCode, wParam, lParam);
+    }
 
-    /* Let the event pass through — we do NOT swallow keys.
-     * The app works alongside normal keyboard input. */
+    /* Key IS bound.
+     * If swallowing is enabled AND the app is active, consume the key.
+     * Otherwise pass it through so other apps still receive it. */
+    if (s_swallowKeys &&
+        s_state->enabled.load(std::memory_order_relaxed)) {
+        return 1;  /* swallow: block key from reaching other apps */
+    }
     return CallNextHookEx(s_hHook, nCode, wParam, lParam);
 }
 
@@ -238,6 +269,20 @@ void UpdateBindings(const KeyBindings& newBindings) {
     s_bindings = newBindings;
     s_bindingsDirty = true;
     LeaveCriticalSection(&s_bindingsCS);
+}
+
+void SetSwallowKeys(bool swallow) {
+    s_swallowKeys = swallow;
+}
+
+void BeginCapture(HWND notifyHwnd) {
+    s_captureHwnd = notifyHwnd;
+    s_captureMode = true;
+}
+
+void EndCapture() {
+    s_captureMode = false;
+    s_captureHwnd = NULL;
 }
 
 } /* namespace hook */

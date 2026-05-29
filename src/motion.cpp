@@ -128,7 +128,6 @@ static unsigned int __stdcall MotionThreadProc(void* param) {
 
     /* ---- Scroll state ---- */
     float scrollAccum = 0.0f;
-    const float SCROLL_SPEED = 600.0f;  /* wheel units per second */
 
     /* ---- Adaptive tick state ---- */
     int  currentTickHz = DEFAULT_TICK_HZ;
@@ -294,8 +293,8 @@ static unsigned int __stdcall MotionThreadProc(void* param) {
             bool scrDown = s_state->scrollDown.load(std::memory_order_relaxed);
 
             float scrollTarget = 0.0f;
-            if (scrUp)   scrollTarget += SCROLL_SPEED;
-            if (scrDown) scrollTarget -= SCROLL_SPEED;
+            if (scrUp)   scrollTarget += p.scrollSpeed;
+            if (scrDown) scrollTarget -= p.scrollSpeed;
 
             scrollTarget *= speedMult;
 

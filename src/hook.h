@@ -50,6 +50,24 @@ namespace hook {
      * Called from config worker or UI thread. */
     void UpdateBindings(const KeyBindings& newBindings);
 
+    /* Enable/disable swallowing of bound keys when active.
+     * When true, bound keys are consumed and NOT passed to other apps. */
+    void SetSwallowKeys(bool swallow);
+
+    /* ---- Inline key capture for remap UI ---- */
+
+    /* Custom message posted to notifyHwnd when a key is captured.
+     * wParam = the captured VK code. */
+    static const UINT WM_KEY_CAPTURED = WM_APP + 10;
+
+    /* Begin single-key capture. The next non-modifier physical keypress
+     * will be posted as WM_KEY_CAPTURED to notifyHwnd, then capture
+     * mode ends automatically. */
+    void BeginCapture(HWND notifyHwnd);
+
+    /* Cancel capture mode (e.g. on ESC or timeout). */
+    void EndCapture();
+
 } /* namespace hook */
 } /* namespace cm */
 

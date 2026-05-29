@@ -108,6 +108,12 @@ AppConfig Load() {
         cfg.toggleHotkey     = ReadString(j, "toggleHotkey", "Alt+S");
         cfg.panicHotkey      = ReadString(j, "panicHotkey", "Ctrl+Alt+Esc");
         cfg.startWithWindows = ReadBool(j, "startWithWindows", false);
+        cfg.swallowKeys      = ReadBool(j, "swallowKeys", false);
+        cfg.winNormL         = ReadInt(j, "winNormL", -1);
+        cfg.winNormT         = ReadInt(j, "winNormT", -1);
+        cfg.winNormR         = ReadInt(j, "winNormR", -1);
+        cfg.winNormB         = ReadInt(j, "winNormB", -1);
+        cfg.winShowCmd       = ReadInt(j, "winShowCmd", 1);
 
         /* Motion parameters */
         cfg.motion.baseSpeed            = ReadFloat(j, "baseSpeed", 180.0f);
@@ -118,6 +124,7 @@ AppConfig Load() {
         cfg.motion.smoothingAccel       = ReadFloat(j, "smoothingAccel", 0.15f);
         cfg.motion.smoothingDecel       = ReadFloat(j, "smoothingDecel", 0.25f);
         cfg.motion.tickHz               = ReadInt(j, "tickHz", DEFAULT_TICK_HZ);
+        cfg.motion.scrollSpeed          = ReadFloat(j, "scrollSpeed", 600.0f);
 
         /* Movement keys */
         if (j.count("movementKeys") && j["movementKeys"].is_object()) {
@@ -177,6 +184,12 @@ bool Save(const AppConfig& cfg) {
         j["toggleHotkey"]        = cfg.toggleHotkey;
         j["panicHotkey"]         = cfg.panicHotkey;
         j["startWithWindows"]    = cfg.startWithWindows;
+        j["swallowKeys"]         = cfg.swallowKeys;
+        j["winNormL"]            = cfg.winNormL;
+        j["winNormT"]            = cfg.winNormT;
+        j["winNormR"]            = cfg.winNormR;
+        j["winNormB"]            = cfg.winNormB;
+        j["winShowCmd"]          = cfg.winShowCmd;
         j["baseSpeed"]           = cfg.motion.baseSpeed;
         j["maxSpeed"]            = cfg.motion.maxSpeed;
         j["accelTimeMs"]         = cfg.motion.accelTimeMs;
@@ -185,6 +198,7 @@ bool Save(const AppConfig& cfg) {
         j["smoothingAccel"]      = cfg.motion.smoothingAccel;
         j["smoothingDecel"]      = cfg.motion.smoothingDecel;
         j["tickHz"]              = cfg.motion.tickHz;
+        j["scrollSpeed"]         = cfg.motion.scrollSpeed;
 
         j["movementKeys"]["up"]    = keys::NameFromVk(cfg.keys.moveUp);
         j["movementKeys"]["down"]  = keys::NameFromVk(cfg.keys.moveDown);
@@ -223,6 +237,7 @@ void Validate(AppConfig& cfg) {
     cfg.motion.smoothingAccel      = util::Clamp(cfg.motion.smoothingAccel, 0.01f, 1.0f);
     cfg.motion.smoothingDecel      = util::Clamp(cfg.motion.smoothingDecel, 0.01f, 1.0f);
     cfg.motion.tickHz              = util::ClampInt(cfg.motion.tickHz, MIN_TICK_HZ, MAX_TICK_HZ);
+    cfg.motion.scrollSpeed         = util::Clamp(cfg.motion.scrollSpeed, 50.0f, 2000.0f);
 
     /* Ensure maxSpeed >= baseSpeed */
     if (cfg.motion.maxSpeed < cfg.motion.baseSpeed) {

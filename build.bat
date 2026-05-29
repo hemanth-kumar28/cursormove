@@ -81,14 +81,21 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [9/10] Compiling ui.cpp...
+echo [9/11] Compiling ui_widgets.cpp...
+%GCC% %CFLAGS% -c src/ui_widgets.cpp -o build/ui_widgets.o
+if %errorlevel% neq 0 (
+    echo [FAIL] ui_widgets.cpp failed
+    exit /b 1
+)
+
+echo [10/11] Compiling ui.cpp...
 %GCC% %CFLAGS% -c src/ui.cpp -o build/ui.o
 if %errorlevel% neq 0 (
     echo [FAIL] ui.cpp failed
     exit /b 1
 )
 
-echo [10/10] Compiling main.cpp...
+echo [11/11] Compiling main.cpp...
 %GCC% %CFLAGS% -c src/main.cpp -o build/main.o
 if %errorlevel% neq 0 (
     echo [FAIL] main.cpp failed
@@ -97,7 +104,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Linking %OUT%...
-%GCC% build/main.o build/util.o build/keys.o build/tray.o build/hook.o build/motion.o build/config.o build/hotkey.o build/ui.o build/resource.o %LDFLAGS% -o %OUT%
+%GCC% build/main.o build/util.o build/keys.o build/tray.o build/hook.o build/motion.o build/config.o build/hotkey.o build/ui_widgets.o build/ui.o build/resource.o %LDFLAGS% -o %OUT%
 if %errorlevel% neq 0 (
     echo [FAIL] Linking failed
     exit /b 1

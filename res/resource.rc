@@ -2,3 +2,5 @@
 
 /* Embed the DPI-aware manifest (RT_MANIFEST = 24) */
 1 24 "app.manifest"
+
+IDI_APPICON ICON "../applicatoin.ico"

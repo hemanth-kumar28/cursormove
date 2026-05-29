@@ -49,6 +49,7 @@ struct MotionParams {
     float smoothingAccel;       /* lerp factor while accelerating          */
     float smoothingDecel;       /* lerp factor while decelerating          */
     int   tickHz;               /* target tick rate                        */
+    float scrollSpeed;          /* wheel units per second                  */
 
     MotionParams()
         : baseSpeed(180.0f)
@@ -59,6 +60,7 @@ struct MotionParams {
         , smoothingAccel(0.15f)
         , smoothingDecel(0.25f)
         , tickHz(DEFAULT_TICK_HZ)
+        , scrollSpeed(600.0f)
     {}
 };
 

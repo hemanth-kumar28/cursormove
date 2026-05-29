@@ -22,6 +22,12 @@ struct AppConfig {
     MotionParams  motion;
     hook::KeyBindings keys;
     bool          startWithWindows;
+    bool          swallowKeys;
+    int           winNormL;
+    int           winNormT;
+    int           winNormR;
+    int           winNormB;
+    int           winShowCmd;
 
     AppConfig()
         : enabled(false)
@@ -30,6 +36,12 @@ struct AppConfig {
         , motion()
         , keys()
         , startWithWindows(false)
+        , swallowKeys(false)
+        , winNormL(-1)
+        , winNormT(-1)
+        , winNormR(-1)
+        , winNormB(-1)
+        , winShowCmd(1) /* SW_SHOWNORMAL = 1 */
     {}
 };
 

@@ -1,8 +1,14 @@
 /*
- * ui.cpp — Settings window with 4 tabs: General, Keys, Motion, Diagnostics.
- * Pure Win32 — no frameworks.
+ * ui.cpp — Settings window with retained-mode custom rendering.
+ *
+ * Zero child HWNDs. One backbuffer. One paint pass.
+ * Left sidebar, auto-save, inline key capture, direct-manipulation sliders.
+ * Catppuccin Mocha palette. Calm professional utility aesthetic.
+ *
+ * MinGW 6.3 / C++14 / pure Win32 GDI.
  */
 #include "ui.h"
+#include "ui_widgets.h"
 #include "hook.h"
 #include "motion.h"
 #include "hotkey.h"
@@ -12,428 +18,1280 @@
 #define _WIN32_IE 0x0600
 #endif
 #include <commctrl.h>
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
 #include "../res/resource.h"
+
+#include <cstdio>
+
+/* DwmSetWindowAttribute — loaded dynamically for dark title bar */
+typedef HRESULT (WINAPI *PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+static PFN_DwmSetWindowAttribute pfnDwmSetWindowAttribute = NULL;
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
 
 namespace cm {
 namespace ui {
 
-/* ---- Module state ---- */
-static HINSTANCE   s_hInst   = NULL;
-static SharedState* s_state  = NULL;
-static AppConfig*  s_config  = NULL;
-static HWND        s_hwnd    = NULL;
-static HWND        s_tab     = NULL;
-static HWND        s_panels[4] = {};
-static int         s_curTab  = 0;
-static UINT_PTR    s_diagTimer = 0;
-static const wchar_t* s_wndClass = L"CursorMoveSettingsWnd";
+/* ---- Window dimensions ---- */
+static const int WIN_W = 560;
+static const int WIN_H = 500;
 
-/* Control IDs */
+/* ---- Module state ---- */
+static HINSTANCE   s_hInst    = NULL;
+static SharedState* s_state   = NULL;
+static AppConfig*  s_config   = NULL;
+static HWND        s_hwnd     = NULL;
+static const wchar_t* s_wndClass = L"CursorMoveSettingsV2";
+
+/* ---- Tab / interaction state ---- */
+static int  s_activeTab   = 0;
+static int  s_hoverTab    = -1;
+static int  s_hoverWidget = -1;
+static int  s_focusWidget = -1;
+static bool s_dragging    = false;  /* slider drag in progress */
+static int  s_dragWidget  = -1;
+
+/* ---- Key capture state ---- */
+static int    s_captureTarget  = -1;   /* widget index being remapped */
+static DWORD  s_captureStart   = 0;
+static bool   s_captureBlink   = false;
+static UINT   s_captureOrigVk  = 0;    /* original VK to restore on cancel */
+
+/* ---- Toast state ---- */
+static bool   s_toastVisible   = false;
+static DWORD  s_toastStart     = 0;
+static int    s_toastFade      = 0;    /* 0 = full, 1-4 = fading, 5 = hidden */
+
+/* ---- Progressive disclosure ---- */
+static bool s_advancedExpanded = false;
+
+/* ---- Timer IDs ---- */
 enum {
-    IDC_TAB = 2001,
-    /* General */
-    IDC_CHK_ENABLED = 2010, IDC_LBL_TOGGLE, IDC_LBL_PANIC, IDC_CHK_STARTUP,
-    /* Motion sliders */
-    IDC_SLD_BASE = 2030, IDC_SLD_MAX, IDC_SLD_ACCEL, IDC_SLD_DECEL,
-    IDC_SLD_PREC, IDC_SLD_SMOOTH, IDC_SLD_TICK,
-    IDC_VAL_BASE, IDC_VAL_MAX, IDC_VAL_ACCEL, IDC_VAL_DECEL,
-    IDC_VAL_PREC, IDC_VAL_SMOOTH, IDC_VAL_TICK,
-    /* Keys remap buttons */
-    IDC_BTN_UP = 2060, IDC_BTN_DOWN, IDC_BTN_LEFT, IDC_BTN_RIGHT,
-    IDC_BTN_CLKL, IDC_BTN_CLKR, IDC_BTN_CLKM,
-    IDC_BTN_SCRU, IDC_BTN_SCRD,
-    IDC_LBL_UP, IDC_LBL_DOWN, IDC_LBL_LEFT, IDC_LBL_RIGHT,
-    IDC_LBL_CLKL, IDC_LBL_CLKR, IDC_LBL_CLKM,
-    IDC_LBL_SCRU, IDC_LBL_SCRD,
-    /* Diag labels */
-    IDC_DIAG_HOOK = 2100, IDC_DIAG_MOTION, IDC_DIAG_ERR,
-    IDC_DIAG_TICK, IDC_DIAG_CPU, IDC_DIAG_MODE,
-    /* Save button */
-    IDC_BTN_SAVE = 2200
+    TIMER_DIAG       = 1,   /* 500ms: diagnostics refresh */
+    TIMER_TOAST      = 3,   /* 100ms: toast fade steps */
+    TIMER_CAPTURE_BLINK = 4,  /* 300ms: capture border pulse */
+    TIMER_CAPTURE_TIMEOUT = 5 /* 1000ms: capture countdown */
 };
 
-static LRESULT CALLBACK SettingsWndProc(HWND, UINT, WPARAM, LPARAM);
+/* ---- Panels ---- */
+static Panel s_panels[5];
 
-/* ---- Helper: create a static label ---- */
-static HWND MakeLabel(HWND parent, const wchar_t* text,
-                      int x, int y, int w, int h, int id = 0) {
-    return CreateWindowW(L"STATIC", text, WS_CHILD|WS_VISIBLE|SS_LEFT,
-                         x, y, w, h, parent, (HMENU)(intptr_t)id, s_hInst, NULL);
+/* ---- Sidebar rect (computed once on WM_CREATE) ---- */
+static RECT s_sidebarRect;
+static RECT s_contentRect;
+
+/* ---- Unique widget IDs ---- */
+enum WidgetId {
+    /* General */
+    WID_GEN_ENABLED = 100,
+    WID_GEN_SWALLOW,
+    WID_GEN_STARTUP,
+    WID_GEN_RESET,
+
+    /* Controls */
+    WID_KEY_MOVE_UP = 200,
+    WID_KEY_MOVE_DOWN,
+    WID_KEY_MOVE_LEFT,
+    WID_KEY_MOVE_RIGHT,
+    WID_KEY_CLICK_LEFT,
+    WID_KEY_CLICK_RIGHT,
+    WID_KEY_CLICK_MIDDLE,
+    WID_KEY_SCROLL_UP,
+    WID_KEY_SCROLL_DOWN,
+    WID_KEY_PRECISION,
+
+    /* Motion */
+    WID_MOT_BASE = 300,
+    WID_MOT_MAX,
+    WID_MOT_ACCEL,
+    WID_MOT_DECEL,
+    WID_MOT_ADVANCED_LINK,
+    WID_MOT_PREC,
+    WID_MOT_SMOOTH,
+    WID_MOT_TICK,
+    WID_MOT_SCROLL,
+    WID_MOT_RESET,
+
+    /* Diagnostics */
+    WID_DIAG_HOOK = 400,
+    WID_DIAG_MOTION,
+    WID_DIAG_TICK,
+    WID_DIAG_CPU,
+    WID_DIAG_ERR,
+    WID_DIAG_MODE,
+};
+
+/* ---- Link action IDs ---- */
+enum LinkAction {
+    LINK_RESET_ALL = 1,
+    LINK_TOGGLE_ADVANCED = 2,
+    LINK_RESET_MOTION = 3,
+};
+
+/* ---- Intermediate int values for sliders ---- */
+/* Sliders need int* pointers. We use these and sync to/from config. */
+static int s_baseSpeed, s_maxSpeed, s_accelTime, s_decelTime;
+static int s_precPct, s_smoothPct, s_tickHz, s_scrollSpeed;
+
+static void SyncSlidersFromConfig() {
+    if (!s_config) return;
+    s_baseSpeed  = (int)s_config->motion.baseSpeed;
+    s_maxSpeed   = (int)s_config->motion.maxSpeed;
+    s_accelTime  = (int)s_config->motion.accelTimeMs;
+    s_decelTime  = (int)s_config->motion.decelTimeMs;
+    s_precPct    = (int)(s_config->motion.precisionMultiplier * 100.0f);
+    s_smoothPct  = (int)(s_config->motion.smoothingAccel * 100.0f);
+    s_tickHz     = s_config->motion.tickHz;
+    s_scrollSpeed = (int)s_config->motion.scrollSpeed;
 }
 
-/* ---- Helper: create a button ---- */
-static HWND MakeButton(HWND parent, const wchar_t* text,
-                       int x, int y, int w, int h, int id) {
-    return CreateWindowW(L"BUTTON", text, WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-                         x, y, w, h, parent, (HMENU)(intptr_t)id, s_hInst, NULL);
+static void SyncSlidersToConfig() {
+    if (!s_config) return;
+    s_config->motion.baseSpeed           = (float)s_baseSpeed;
+    s_config->motion.maxSpeed            = (float)s_maxSpeed;
+    s_config->motion.accelTimeMs         = (float)s_accelTime;
+    s_config->motion.decelTimeMs         = (float)s_decelTime;
+    s_config->motion.precisionMultiplier = s_precPct / 100.0f;
+    s_config->motion.smoothingAccel      = s_smoothPct / 100.0f;
+    s_config->motion.smoothingDecel      = s_smoothPct / 100.0f;
+    s_config->motion.tickHz              = s_tickHz;
+    s_config->motion.scrollSpeed         = (float)s_scrollSpeed;
 }
 
-/* ---- Helper: create a checkbox ---- */
-static HWND MakeCheck(HWND parent, const wchar_t* text,
-                      int x, int y, int w, int h, int id) {
-    return CreateWindowW(L"BUTTON", text,
-                         WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
-                         x, y, w, h, parent, (HMENU)(intptr_t)id, s_hInst, NULL);
+/* ---- Auto-save + toast ---- */
+static void AutoSave() {
+    if (!s_config) return;
+    config::Validate(*s_config);
+    config::Save(*s_config);
+    motion::UpdateParams(s_config->motion);
+
+    /* Show toast */
+    s_toastVisible = true;
+    s_toastStart = GetTickCount();
+    s_toastFade = 0;
+    SetTimer(s_hwnd, TIMER_TOAST, 100, NULL);
+    if (s_hwnd) InvalidateRect(s_hwnd, NULL, FALSE);
 }
 
-/* ---- Helper: create a trackbar (slider) ---- */
-static HWND MakeSlider(HWND parent, int x, int y, int w, int h,
-                       int id, int minVal, int maxVal, int curVal) {
-    HWND sl = CreateWindowW(TRACKBAR_CLASSW, L"",
-        WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_AUTOTICKS,
-        x, y, w, h, parent, (HMENU)(intptr_t)id, s_hInst, NULL);
-    if (sl) {
-        SendMessage(sl, TBM_SETRANGE, TRUE, MAKELONG(minVal, maxVal));
-        SendMessage(sl, TBM_SETPOS, TRUE, curVal);
+/* ---- Update key badge display text ---- */
+static void UpdateKeyBadgeText(Widget& w) {
+    if (w.vkVal) {
+        std::string name = keys::NameFromVk(*w.vkVal);
+        for (int i = 0; i < 31 && name[i]; ++i) {
+            w.valueText[i] = (wchar_t)name[i];
+            w.valueText[i + 1] = L'\0';
+        }
     }
-    return sl;
 }
 
-/* ---- Helper: set label to narrow string ---- */
-static void SetLabelA(HWND hwnd, int id, const char* text) {
-    wchar_t buf[64];
-    for (int i = 0; i < 63 && text[i]; ++i) {
-        buf[i] = (wchar_t)text[i];
-        buf[i+1] = 0;
+/* ================================================================
+ * Build panels
+ * ================================================================ */
+static void BuildGeneralPanel() {
+    Panel& p = s_panels[0];
+    p.count = 0;
+
+    p.Add(WidgetType::SectionHeader, 0, L"Status");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    Widget* wEnabled = p.Add(WidgetType::Toggle, WID_GEN_ENABLED, L"Enabled");
+    if (wEnabled && s_state) {
+        static bool s_enabledLocal = false;
+        s_enabledLocal = s_state->enabled.load(std::memory_order_relaxed);
+        wEnabled->boolVal = &s_enabledLocal;
     }
-    SetDlgItemTextW(hwnd, id, buf);
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.SM;
+
+    p.Add(WidgetType::SectionHeader, 0, L"Hotkeys");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    Widget* wToggle = p.Add(WidgetType::Label, 0, L"Toggle");
+    /* Show the actual hotkey string beside it */
+    if (wToggle) {
+        _snwprintf(wToggle->valueText, 31, L"Alt + S");
+    }
+
+    Widget* wPanic = p.Add(WidgetType::Label, 0, L"Panic");
+    if (wPanic) {
+        _snwprintf(wPanic->valueText, 31, L"Ctrl + Alt + Esc");
+    }
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.SM;
+
+    p.Add(WidgetType::SectionHeader, 0, L"Options");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    Widget* wSwallow = p.Add(WidgetType::Toggle, WID_GEN_SWALLOW,
+                              L"Swallow keys");
+    if (wSwallow && s_config) wSwallow->boolVal = &s_config->swallowKeys;
+
+    p.Add(WidgetType::MetaLabel, 0, L"Block bound keys from reaching other apps");
+
+    Widget* wStartup = p.Add(WidgetType::Toggle, WID_GEN_STARTUP,
+                              L"Start with Windows");
+    if (wStartup && s_config) wStartup->boolVal = &s_config->startWithWindows;
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.LG;
+
+    Widget* wReset = p.Add(WidgetType::LinkButton, WID_GEN_RESET,
+                            L"Reset all settings");
+    if (wReset) wReset->linkAction = LINK_RESET_ALL;
 }
 
-/* ---- Show the selected tab panel ---- */
-static void ShowTab(int idx) {
+static void BuildControlsPanel() {
+    Panel& p = s_panels[1];
+    p.count = 0;
+
+    p.Add(WidgetType::SectionHeader, 0, L"Key Bindings");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    struct KeyRow {
+        const wchar_t* label;
+        int id;
+        UINT* vk;
+    };
+
+    KeyRow rows[] = {
+        {L"Move Up",       WID_KEY_MOVE_UP,     &s_config->keys.moveUp},
+        {L"Move Down",     WID_KEY_MOVE_DOWN,    &s_config->keys.moveDown},
+        {L"Move Left",     WID_KEY_MOVE_LEFT,    &s_config->keys.moveLeft},
+        {L"Move Right",    WID_KEY_MOVE_RIGHT,   &s_config->keys.moveRight},
+    };
     for (int i = 0; i < 4; ++i) {
-        if (s_panels[i])
-            ShowWindow(s_panels[i], (i == idx) ? SW_SHOW : SW_HIDE);
-    }
-    s_curTab = idx;
-}
-
-/* ---- Update key label text from config ---- */
-static void RefreshKeyLabels() {
-    if (!s_config || !s_panels[1]) return;
-    HWND p = s_panels[1];
-    SetLabelA(p, IDC_LBL_UP,    keys::NameFromVk(s_config->keys.moveUp).c_str());
-    SetLabelA(p, IDC_LBL_DOWN,  keys::NameFromVk(s_config->keys.moveDown).c_str());
-    SetLabelA(p, IDC_LBL_LEFT,  keys::NameFromVk(s_config->keys.moveLeft).c_str());
-    SetLabelA(p, IDC_LBL_RIGHT, keys::NameFromVk(s_config->keys.moveRight).c_str());
-    SetLabelA(p, IDC_LBL_CLKL,  keys::NameFromVk(s_config->keys.clickLeft).c_str());
-    SetLabelA(p, IDC_LBL_CLKR,  keys::NameFromVk(s_config->keys.clickRight).c_str());
-    SetLabelA(p, IDC_LBL_CLKM,  keys::NameFromVk(s_config->keys.clickMiddle).c_str());
-    SetLabelA(p, IDC_LBL_SCRU,  keys::NameFromVk(s_config->keys.scrollUp).c_str());
-    SetLabelA(p, IDC_LBL_SCRD,  keys::NameFromVk(s_config->keys.scrollDown).c_str());
-}
-
-/* ---- Update slider value labels ---- */
-static void RefreshSliderLabels() {
-    if (!s_panels[2]) return;
-    HWND p = s_panels[2];
-    wchar_t buf[32];
-    auto setVal = [&](int sliderId, int lblId, const wchar_t* fmt) {
-        HWND sl = GetDlgItem(p, sliderId);
-        if (!sl) return;
-        int v = (int)SendMessage(sl, TBM_GETPOS, 0, 0);
-        _snwprintf(buf, 32, fmt, v);
-        SetDlgItemTextW(p, lblId, buf);
-    };
-    setVal(IDC_SLD_BASE,  IDC_VAL_BASE,  L"%d px/s");
-    setVal(IDC_SLD_MAX,   IDC_VAL_MAX,   L"%d px/s");
-    setVal(IDC_SLD_ACCEL, IDC_VAL_ACCEL, L"%d ms");
-    setVal(IDC_SLD_DECEL, IDC_VAL_DECEL, L"%d ms");
-    setVal(IDC_SLD_TICK,  IDC_VAL_TICK,  L"%d Hz");
-    /* Precision: stored as pct (5-100) */
-    {
-        HWND sl = GetDlgItem(p, IDC_SLD_PREC);
-        if (sl) {
-            int v = (int)SendMessage(sl, TBM_GETPOS, 0, 0);
-            _snwprintf(buf, 32, L"%d%%", v);
-            SetDlgItemTextW(p, IDC_VAL_PREC, buf);
+        Widget* w = p.Add(WidgetType::KeyBadge, rows[i].id, rows[i].label);
+        if (w) {
+            w->vkVal = rows[i].vk;
+            UpdateKeyBadgeText(*w);
         }
     }
-    /* Smoothing: stored as pct (1-100) */
-    {
-        HWND sl = GetDlgItem(p, IDC_SLD_SMOOTH);
-        if (sl) {
-            int v = (int)SendMessage(sl, TBM_GETPOS, 0, 0);
-            _snwprintf(buf, 32, L"%d%%", v);
-            SetDlgItemTextW(p, IDC_VAL_SMOOTH, buf);
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.MD;
+
+    KeyRow clickRows[] = {
+        {L"Click Left",    WID_KEY_CLICK_LEFT,   &s_config->keys.clickLeft},
+        {L"Click Right",   WID_KEY_CLICK_RIGHT,  &s_config->keys.clickRight},
+        {L"Click Middle",  WID_KEY_CLICK_MIDDLE,  &s_config->keys.clickMiddle},
+    };
+    for (int i = 0; i < 3; ++i) {
+        Widget* w = p.Add(WidgetType::KeyBadge, clickRows[i].id, clickRows[i].label);
+        if (w) {
+            w->vkVal = clickRows[i].vk;
+            UpdateKeyBadgeText(*w);
         }
     }
-}
 
-/* ---- Create the General tab panel ---- */
-static HWND CreateGeneralPanel(HWND parent) {
-    HWND p = CreateWindowW(L"STATIC", L"", WS_CHILD|WS_CLIPSIBLINGS,
-                           5, 30, 460, 330, parent, NULL, s_hInst, NULL);
-    HWND chk = MakeCheck(p, L"Enabled", 20, 15, 120, 22, IDC_CHK_ENABLED);
-    if (s_state && s_state->enabled.load(std::memory_order_relaxed))
-        SendMessage(chk, BM_SETCHECK, BST_CHECKED, 0);
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.MD;
 
-    MakeLabel(p, L"Toggle hotkey:", 20, 50, 120, 20);
-    MakeLabel(p, L"Alt+S", 150, 50, 200, 20, IDC_LBL_TOGGLE);
-
-    MakeLabel(p, L"Panic hotkey:", 20, 80, 120, 20);
-    MakeLabel(p, L"Ctrl+Alt+Esc", 150, 80, 200, 20, IDC_LBL_PANIC);
-
-    MakeCheck(p, L"Start with Windows", 20, 115, 200, 22, IDC_CHK_STARTUP);
-    return p;
-}
-
-/* ---- Create the Keys tab panel ---- */
-static HWND CreateKeysPanel(HWND parent) {
-    HWND p = CreateWindowW(L"STATIC", L"", WS_CHILD|WS_CLIPSIBLINGS,
-                           5, 30, 460, 330, parent, NULL, s_hInst, NULL);
-    struct Row { const wchar_t* label; int btnId; int lblId; };
-    Row rows[] = {
-        {L"Move Up",     IDC_BTN_UP,   IDC_LBL_UP},
-        {L"Move Down",   IDC_BTN_DOWN, IDC_LBL_DOWN},
-        {L"Move Left",   IDC_BTN_LEFT, IDC_LBL_LEFT},
-        {L"Move Right",  IDC_BTN_RIGHT,IDC_LBL_RIGHT},
-        {L"Click Left",  IDC_BTN_CLKL, IDC_LBL_CLKL},
-        {L"Click Right", IDC_BTN_CLKR, IDC_LBL_CLKR},
-        {L"Click Middle",IDC_BTN_CLKM, IDC_LBL_CLKM},
-        {L"Scroll Up",   IDC_BTN_SCRU, IDC_LBL_SCRU},
-        {L"Scroll Down", IDC_BTN_SCRD, IDC_LBL_SCRD},
+    KeyRow scrollRows[] = {
+        {L"Scroll Up",     WID_KEY_SCROLL_UP,    &s_config->keys.scrollUp},
+        {L"Scroll Down",   WID_KEY_SCROLL_DOWN,  &s_config->keys.scrollDown},
     };
-    int y = 10;
-    for (int i = 0; i < 9; ++i) {
-        MakeLabel(p, rows[i].label, 20, y+3, 100, 20);
-        MakeLabel(p, L"...", 130, y+3, 80, 20, rows[i].lblId);
-        MakeButton(p, L"Remap", 220, y, 65, 24, rows[i].btnId);
-        y += 30;
+    for (int i = 0; i < 2; ++i) {
+        Widget* w = p.Add(WidgetType::KeyBadge, scrollRows[i].id, scrollRows[i].label);
+        if (w) {
+            w->vkVal = scrollRows[i].vk;
+            UpdateKeyBadgeText(*w);
+        }
     }
-    return p;
-}
 
-/* ---- Create the Motion tab panel ---- */
-static HWND CreateMotionPanel(HWND parent) {
-    HWND p = CreateWindowW(L"STATIC", L"", WS_CHILD|WS_CLIPSIBLINGS,
-                           5, 30, 460, 330, parent, NULL, s_hInst, NULL);
-    const MotionParams& m = s_config->motion;
-    struct SlRow {
-        const wchar_t* label; int sldId; int valId;
-        int lo; int hi; int cur;
-    };
-    SlRow rows[] = {
-        {L"Base speed",   IDC_SLD_BASE,  IDC_VAL_BASE,  50, 500, (int)m.baseSpeed},
-        {L"Max speed",    IDC_SLD_MAX,   IDC_VAL_MAX,   200, 3000, (int)m.maxSpeed},
-        {L"Accel time",   IDC_SLD_ACCEL, IDC_VAL_ACCEL, 50, 1000, (int)m.accelTimeMs},
-        {L"Decel time",   IDC_SLD_DECEL, IDC_VAL_DECEL, 50, 500, (int)m.decelTimeMs},
-        {L"Precision %",  IDC_SLD_PREC,  IDC_VAL_PREC,  5, 100, (int)(m.precisionMultiplier*100)},
-        {L"Smoothing %",  IDC_SLD_SMOOTH,IDC_VAL_SMOOTH, 1, 100, (int)(m.smoothingAccel*100)},
-        {L"Tick rate",    IDC_SLD_TICK,  IDC_VAL_TICK,  60, 120, m.tickHz},
-    };
-    int y = 10;
-    for (int i = 0; i < 7; ++i) {
-        MakeLabel(p, rows[i].label, 10, y+5, 90, 18);
-        MakeSlider(p, 105, y, 240, 28, rows[i].sldId,
-                   rows[i].lo, rows[i].hi, rows[i].cur);
-        MakeLabel(p, L"", 355, y+5, 80, 18, rows[i].valId);
-        y += 38;
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.MD;
+
+    Widget* wPrec = p.Add(WidgetType::KeyBadge, WID_KEY_PRECISION, L"Precision Hold");
+    if (wPrec) {
+        wPrec->vkVal = &s_config->keys.precisionToggle;
+        UpdateKeyBadgeText(*wPrec);
     }
-    MakeButton(p, L"Apply && Save", 105, y+5, 130, 28, IDC_BTN_SAVE);
-    return p;
 }
 
-/* ---- Create the Diagnostics tab panel ---- */
-static HWND CreateDiagPanel(HWND parent) {
-    HWND p = CreateWindowW(L"STATIC", L"", WS_CHILD|WS_CLIPSIBLINGS,
-                           5, 30, 460, 330, parent, NULL, s_hInst, NULL);
-    struct DRow { const wchar_t* label; int id; };
-    DRow rows[] = {
-        {L"Hook status:",   IDC_DIAG_HOOK},
-        {L"Motion engine:", IDC_DIAG_MOTION},
-        {L"Last error:",    IDC_DIAG_ERR},
-        {L"Tick rate:",     IDC_DIAG_TICK},
-        {L"CPU load:",      IDC_DIAG_CPU},
-        {L"Mode:",          IDC_DIAG_MODE},
-    };
-    int y = 15;
-    for (int i = 0; i < 6; ++i) {
-        MakeLabel(p, rows[i].label, 20, y, 120, 20);
-        MakeLabel(p, L"...", 150, y, 250, 20, rows[i].id);
-        y += 30;
+static void BuildMotionPanel() {
+    Panel& p = s_panels[2];
+    p.count = 0;
+
+    SyncSlidersFromConfig();
+
+    p.Add(WidgetType::SectionHeader, 0, L"Cursor Speed");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    Widget* wBase = p.Add(WidgetType::Slider, WID_MOT_BASE, L"Base speed");
+    if (wBase) {
+        wBase->intVal = &s_baseSpeed;
+        wBase->sliderMin = 50; wBase->sliderMax = 500;
+        wBase->sliderDefault = 180; wBase->sliderUnit = L"px/s";
     }
-    return p;
+
+    Widget* wMax = p.Add(WidgetType::Slider, WID_MOT_MAX, L"Max speed");
+    if (wMax) {
+        wMax->intVal = &s_maxSpeed;
+        wMax->sliderMin = 200; wMax->sliderMax = 3000;
+        wMax->sliderDefault = 1200; wMax->sliderUnit = L"px/s";
+    }
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.SM;
+    p.Add(WidgetType::SectionHeader, 0, L"Acceleration");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    Widget* wAccel = p.Add(WidgetType::Slider, WID_MOT_ACCEL, L"Accel time");
+    if (wAccel) {
+        wAccel->intVal = &s_accelTime;
+        wAccel->sliderMin = 50; wAccel->sliderMax = 1000;
+        wAccel->sliderDefault = 250; wAccel->sliderUnit = L"ms";
+    }
+
+    Widget* wDecel = p.Add(WidgetType::Slider, WID_MOT_DECEL, L"Decel time");
+    if (wDecel) {
+        wDecel->intVal = &s_decelTime;
+        wDecel->sliderMin = 50; wDecel->sliderMax = 500;
+        wDecel->sliderDefault = 140; wDecel->sliderUnit = L"ms";
+    }
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.SM;
+
+    /* Advanced toggle */
+    Widget* wAdv = p.Add(WidgetType::LinkButton, WID_MOT_ADVANCED_LINK, L"");
+    if (wAdv) {
+        wAdv->linkAction = LINK_TOGGLE_ADVANCED;
+        wcscpy(wAdv->label, s_advancedExpanded ? L"Advanced \x25BE" : L"Advanced \x25B8");
+    }
+
+    /* Advanced widgets — visibility controlled by s_advancedExpanded */
+    Widget* wPrec = p.Add(WidgetType::Slider, WID_MOT_PREC, L"Precision %");
+    if (wPrec) {
+        wPrec->intVal = &s_precPct;
+        wPrec->sliderMin = 5; wPrec->sliderMax = 100;
+        wPrec->sliderDefault = 35; wPrec->sliderUnit = L"%";
+        wPrec->visible = s_advancedExpanded;
+    }
+
+    Widget* wSmooth = p.Add(WidgetType::Slider, WID_MOT_SMOOTH, L"Smoothing %");
+    if (wSmooth) {
+        wSmooth->intVal = &s_smoothPct;
+        wSmooth->sliderMin = 1; wSmooth->sliderMax = 100;
+        wSmooth->sliderDefault = 15; wSmooth->sliderUnit = L"%";
+        wSmooth->visible = s_advancedExpanded;
+    }
+
+    Widget* wTick = p.Add(WidgetType::Slider, WID_MOT_TICK, L"Tick rate");
+    if (wTick) {
+        wTick->intVal = &s_tickHz;
+        wTick->sliderMin = 60; wTick->sliderMax = 120;
+        wTick->sliderDefault = 90; wTick->sliderUnit = L"Hz";
+        wTick->visible = s_advancedExpanded;
+    }
+
+    Widget* wScroll = p.Add(WidgetType::Slider, WID_MOT_SCROLL, L"Scroll speed");
+    if (wScroll) {
+        wScroll->intVal = &s_scrollSpeed;
+        wScroll->sliderMin = 50; wScroll->sliderMax = 2000;
+        wScroll->sliderDefault = 600; wScroll->sliderUnit = L"u/s";
+        wScroll->visible = s_advancedExpanded;
+    }
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.SM;
+
+    Widget* wReset = p.Add(WidgetType::LinkButton, WID_MOT_RESET, L"Reset to defaults");
+    if (wReset) wReset->linkAction = LINK_RESET_MOTION;
 }
 
-/* ---- Update diagnostics labels ---- */
+static void BuildDiagnosticsPanel() {
+    Panel& p = s_panels[3];
+    p.count = 0;
+
+    p.Add(WidgetType::SectionHeader, 0, L"System Status");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    Widget* w;
+    w = p.Add(WidgetType::StatusRow, WID_DIAG_HOOK, L"Hook");
+    if (w) { w->statusColor = 1; wcscpy(w->valueText, L"Active"); }
+
+    w = p.Add(WidgetType::StatusRow, WID_DIAG_MOTION, L"Motion");
+    if (w) { w->statusColor = 1; wcscpy(w->valueText, L"Running"); }
+
+    w = p.Add(WidgetType::StatusRow, WID_DIAG_TICK, L"Tick rate");
+    if (w) { w->statusColor = 0; wcscpy(w->valueText, L"90 Hz"); }
+
+    w = p.Add(WidgetType::StatusRow, WID_DIAG_CPU, L"CPU");
+    if (w) { w->statusColor = 0; wcscpy(w->valueText, L"0%"); }
+
+    w = p.Add(WidgetType::StatusRow, WID_DIAG_ERR, L"Last error");
+    if (w) { w->statusColor = 0; wcscpy(w->valueText, L"None"); }
+
+    w = p.Add(WidgetType::StatusRow, WID_DIAG_MODE, L"Mode");
+    if (w) { w->statusColor = 0; wcscpy(w->valueText, L"Normal"); }
+
+    p.Add(WidgetType::Spacer, 0, L"")->spacerH = g_theme.spacing.LG;
+    p.Add(WidgetType::MetaLabel, 0, L"Refreshes every 500ms");
+}
+
+static void BuildAboutPanel() {
+    Panel& p = s_panels[4];
+    p.count = 0;
+
+    p.Add(WidgetType::SectionHeader, 0, L"CursorMove");
+    p.Add(WidgetType::Separator, 0, L"");
+
+    p.Add(WidgetType::Label, 0, L"Version 1.0");
+    p.Add(WidgetType::MetaLabel, 0, L"Keyboard-driven cursor control");
+    p.Add(WidgetType::MetaLabel, 0, L"for Windows");
+}
+
+static void BuildAllPanels() {
+    BuildGeneralPanel();
+    BuildControlsPanel();
+    BuildMotionPanel();
+    BuildDiagnosticsPanel();
+    BuildAboutPanel();
+}
+
+/* ================================================================
+ * Diagnostics refresh
+ * ================================================================ */
 static void UpdateDiagnostics() {
-    if (!s_state || !s_panels[3]) return;
-    HWND p = s_panels[3];
-    wchar_t buf[64];
-    bool hook  = s_state->hookAlive.load(std::memory_order_relaxed);
-    bool mot   = s_state->motionAlive.load(std::memory_order_relaxed);
-    int  tick  = s_state->currentTickHz.load(std::memory_order_relaxed);
-    int  cpu   = s_state->cpuLoadPercent.load(std::memory_order_relaxed);
-    DWORD err  = s_state->lastError.load(std::memory_order_relaxed);
-    bool en    = s_state->enabled.load(std::memory_order_relaxed);
-    bool prec  = s_state->precisionMode.load(std::memory_order_relaxed);
+    if (!s_state) return;
+    Panel& p = s_panels[3];
+    wchar_t buf[32];
 
-    SetDlgItemTextW(p, IDC_DIAG_HOOK,   hook ? L"Active" : L"Inactive");
-    SetDlgItemTextW(p, IDC_DIAG_MOTION, mot ? L"Running" : L"Stopped");
-    _snwprintf(buf, 64, L"%lu", (unsigned long)err);
-    SetDlgItemTextW(p, IDC_DIAG_ERR, err == 0 ? L"None" : buf);
-    _snwprintf(buf, 64, L"%d Hz", tick);
-    SetDlgItemTextW(p, IDC_DIAG_TICK, buf);
-    _snwprintf(buf, 64, L"%d%%", cpu);
-    SetDlgItemTextW(p, IDC_DIAG_CPU, buf);
-    SetDlgItemTextW(p, IDC_DIAG_MODE,
-        !en ? L"Disabled" : prec ? L"Precision" : L"Normal");
+    for (int i = 0; i < p.count; ++i) {
+        Widget& w = p.widgets[i];
+        switch (w.id) {
+        case WID_DIAG_HOOK: {
+            bool alive = s_state->hookAlive.load(std::memory_order_relaxed);
+            wcscpy(w.valueText, alive ? L"Active" : L"Inactive");
+            w.statusColor = alive ? 1 : 2;
+            break;
+        }
+        case WID_DIAG_MOTION: {
+            bool alive = s_state->motionAlive.load(std::memory_order_relaxed);
+            wcscpy(w.valueText, alive ? L"Running" : L"Stopped");
+            w.statusColor = alive ? 1 : 2;
+            break;
+        }
+        case WID_DIAG_TICK:
+            _snwprintf(buf, 32, L"%d Hz",
+                s_state->currentTickHz.load(std::memory_order_relaxed));
+            wcscpy(w.valueText, buf);
+            break;
+        case WID_DIAG_CPU:
+            _snwprintf(buf, 32, L"%d%%",
+                s_state->cpuLoadPercent.load(std::memory_order_relaxed));
+            wcscpy(w.valueText, buf);
+            break;
+        case WID_DIAG_ERR: {
+            DWORD err = s_state->lastError.load(std::memory_order_relaxed);
+            if (err == 0) wcscpy(w.valueText, L"None");
+            else { _snwprintf(buf, 32, L"%lu", (unsigned long)err); wcscpy(w.valueText, buf); }
+            break;
+        }
+        case WID_DIAG_MODE: {
+            bool en = s_state->enabled.load(std::memory_order_relaxed);
+            bool pr = s_state->precisionMode.load(std::memory_order_relaxed);
+            wcscpy(w.valueText, !en ? L"Disabled" : pr ? L"Precision" : L"Normal");
+            break;
+        }
+        }
+    }
 }
 
-/* ---- Remap dialog: capture next key press ---- */
-static UINT DoRemapDialog(HWND parent) {
-    MessageBoxW(parent,
-        L"Press the key you want to assign.\n\n"
-        L"(After closing this dialog, press the desired key\n"
-        L"within 3 seconds.)",
-        L"Remap Key", MB_OK | MB_ICONINFORMATION);
+/* Sync the General panel's "Enabled" toggle from live state */
+static void SyncEnabledToggle() {
+    Panel& p = s_panels[0];
+    for (int i = 0; i < p.count; ++i) {
+        if (p.widgets[i].id == WID_GEN_ENABLED && p.widgets[i].boolVal) {
+            *p.widgets[i].boolVal = s_state->enabled.load(std::memory_order_relaxed);
+        }
+    }
+}
 
-    /* Poll for a new keypress for 3 seconds */
-    DWORD start = GetTickCount();
-    while (GetTickCount() - start < 3000) {
-        for (int vk = 1; vk < 256; ++vk) {
-            /* Skip modifiers and mouse buttons */
-            if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
-            if (vk == VK_CONTROL || vk == VK_SHIFT || vk == VK_MENU) continue;
-            if (vk == VK_LCONTROL || vk == VK_RCONTROL) continue;
-            if (vk == VK_LSHIFT || vk == VK_RSHIFT) continue;
-            if (vk == VK_LMENU || vk == VK_RMENU) continue;
-            if (vk == VK_ESCAPE) continue;  /* reserved */
+/* FindWidget removed — use direct iteration when needed */
 
-            if (GetAsyncKeyState(vk) & 0x8000) {
-                /* Wait for release */
-                while (GetAsyncKeyState(vk) & 0x8000) Sleep(10);
-                if (keys::IsValidBindableVk((UINT)vk))
-                    return (UINT)vk;
+/* ================================================================
+ * Key capture helpers
+ * ================================================================ */
+static void StartCapture(int widgetIdx) {
+    Panel& p = s_panels[1];
+    if (widgetIdx < 0 || widgetIdx >= p.count) return;
+    Widget& w = p.widgets[widgetIdx];
+    if (w.type != WidgetType::KeyBadge) return;
+
+    s_captureTarget = widgetIdx;
+    s_captureOrigVk = w.vkVal ? *w.vkVal : 0;
+    s_captureStart = GetTickCount();
+    s_captureBlink = true;
+
+    /* Transform to capture widget */
+    w.type = WidgetType::KeyCapture;
+    wcscpy(w.valueText, L"3s");
+
+    /* Start hook capture */
+    hook::BeginCapture(s_hwnd);
+
+    /* Start blink and countdown timers */
+    SetTimer(s_hwnd, TIMER_CAPTURE_BLINK, 300, NULL);
+    SetTimer(s_hwnd, TIMER_CAPTURE_TIMEOUT, 1000, NULL);
+    InvalidateRect(s_hwnd, NULL, FALSE);
+}
+
+static void EndCapture(bool success, UINT newVk = 0) {
+    if (s_captureTarget < 0) return;
+    Panel& p = s_panels[1];
+    Widget& w = p.widgets[s_captureTarget];
+
+    /* Kill timers */
+    KillTimer(s_hwnd, TIMER_CAPTURE_BLINK);
+    KillTimer(s_hwnd, TIMER_CAPTURE_TIMEOUT);
+    hook::EndCapture();
+
+    if (success && newVk != 0 && w.vkVal) {
+        *w.vkVal = newVk;
+        hook::UpdateBindings(s_config->keys);
+        config::Save(*s_config);
+
+        /* Show toast */
+        s_toastVisible = true;
+        s_toastStart = GetTickCount();
+        s_toastFade = 0;
+        SetTimer(s_hwnd, TIMER_TOAST, 100, NULL);
+    } else if (w.vkVal) {
+        /* Restore original */
+        *w.vkVal = s_captureOrigVk;
+    }
+
+    /* Restore to key badge */
+    w.type = WidgetType::KeyBadge;
+    UpdateKeyBadgeText(w);
+
+    s_captureTarget = -1;
+    InvalidateRect(s_hwnd, NULL, FALSE);
+}
+
+/* ================================================================
+ * Handle link button actions
+ * ================================================================ */
+static void HandleLinkAction(int action) {
+    switch (action) {
+    case LINK_RESET_ALL: {
+        *s_config = config::Default();
+        config::Validate(*s_config);
+        hook::UpdateBindings(s_config->keys);
+        hook::SetSwallowKeys(s_config->swallowKeys);
+        SyncSlidersFromConfig();
+        BuildAllPanels();
+        LayoutPanel(s_panels[s_activeTab], s_contentRect);
+        AutoSave();
+        break;
+    }
+    case LINK_TOGGLE_ADVANCED:
+        s_advancedExpanded = !s_advancedExpanded;
+        BuildMotionPanel();
+        LayoutPanel(s_panels[2], s_contentRect);
+        InvalidateRect(s_hwnd, NULL, FALSE);
+        break;
+
+    case LINK_RESET_MOTION: {
+        MotionParams def;
+        s_config->motion = def;
+        SyncSlidersFromConfig();
+        BuildMotionPanel();
+        LayoutPanel(s_panels[2], s_contentRect);
+        AutoSave();
+        break;
+    }
+    }
+}
+
+/* ---- DPI & Scroll state ---- */
+static int  s_scrollY = 0;
+static int  s_maxScroll = 0;
+static bool s_scrollDragging = false;
+static bool s_scrollHover = false;
+static int  s_wheelAccumulator = 0;
+static int  s_lastMouseY = 0;
+
+typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+static PFN_GetDpiForWindow pfnGetDpiForWindow = NULL;
+
+typedef BOOL (WINAPI *PFN_AdjustWindowRectExForDpi)(LPRECT, DWORD, BOOL, DWORD, UINT);
+static PFN_AdjustWindowRectExForDpi pfnAdjustWindowRectExForDpi = NULL;
+
+/* ================================================================
+ * Settings window procedure
+ * ================================================================ */
+static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg,
+                                         WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+
+    /* ---- Window creation ---- */
+    case WM_CREATE: {
+        s_hwnd = hwnd;
+
+        /* Get initial DPI and initialize theme */
+        int dpi = 96;
+        if (pfnGetDpiForWindow) {
+            dpi = pfnGetDpiForWindow(hwnd);
+        } else {
+            HDC hdc = GetDC(hwnd);
+            dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+            ReleaseDC(hwnd, hdc);
+        }
+        g_theme.Init(dpi);
+
+        /* Compute layout regions */
+        RECT clientRc;
+        GetClientRect(hwnd, &clientRc);
+        s_sidebarRect = { 0, 0, g_theme.spacing.SidebarW, clientRc.bottom };
+        s_contentRect = { g_theme.spacing.SidebarW, 0, clientRc.right, clientRc.bottom };
+
+        /* Build all panels */
+        BuildAllPanels();
+        LayoutPanel(s_panels[s_activeTab], s_contentRect);
+
+        /* Start diagnostics timer */
+        SetTimer(hwnd, TIMER_DIAG, 500, NULL);
+
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        int newDpi = HIWORD(wParam);
+        g_theme.Init(newDpi);
+
+        RECT* suggested = (RECT*)lParam;
+        SetWindowPos(hwnd, NULL,
+            suggested->left, suggested->top,
+            suggested->right - suggested->left,
+            suggested->bottom - suggested->top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+
+        return 0;
+    }
+
+    case WM_SIZE: {
+        int cw = (short)LOWORD(lParam);
+        int ch = (short)HIWORD(lParam);
+
+        s_sidebarRect = { 0, 0, g_theme.spacing.SidebarW, ch };
+        s_contentRect = { g_theme.spacing.SidebarW, 0, cw, ch };
+
+        Panel& panel = s_panels[s_activeTab];
+        LayoutPanel(panel, s_contentRect);
+
+        int totalContentHeight = 0;
+        if (panel.count > 0) {
+            totalContentHeight = panel.widgets[panel.count - 1].bounds.bottom + g_theme.spacing.LG;
+        }
+
+        s_maxScroll = totalContentHeight - ch;
+        if (s_maxScroll < 0) s_maxScroll = 0;
+
+        if (s_scrollY > s_maxScroll) s_scrollY = s_maxScroll;
+        return 0;
+    }
+
+    /* ---- Paint ---- */
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+        /* Double buffer */
+        RECT clientRc;
+        GetClientRect(hwnd, &clientRc);
+        int cw = clientRc.right - clientRc.left;
+        int ch = clientRc.bottom - clientRc.top;
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, cw, ch);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+
+        /* Fill backgrounds */
+        FillRect(memDC, &s_contentRect, g_theme.brBase);
+
+        /* Paint sidebar (not scrolled) */
+        PaintSidebar(memDC, s_sidebarRect, s_activeTab, s_hoverTab, g_theme);
+
+        /* Apply clipping to content area to avoid drawing over sidebar or outside */
+        HRGN hClip = CreateRectRgnIndirect(&s_contentRect);
+        SelectClipRgn(memDC, hClip);
+        DeleteObject(hClip); // CRITICAL: Free immediately
+
+        /* Apply viewport translation for scrolling */
+        SetViewportOrgEx(memDC, 0, -s_scrollY, NULL);
+
+        /* Paint active panel widgets */
+        Panel& panel = s_panels[s_activeTab];
+        for (int i = 0; i < panel.count; ++i) {
+            bool focused = (i == s_focusWidget);
+            PaintWidget(memDC, panel.widgets[i], g_theme,
+                        focused, s_captureBlink ? 1 : 0);
+        }
+
+        /* Reset viewport and clipping */
+        SetViewportOrgEx(memDC, 0, 0, NULL);
+        SelectClipRgn(memDC, NULL);
+
+        /* Draw custom scrollbar */
+        if (s_maxScroll > 0) {
+            int sbWidth = (int)(10 * g_theme.scale);
+            int sbRight = clientRc.right - (int)(4 * g_theme.scale);
+            int sbLeft = sbRight - sbWidth;
+            int sbTop = s_contentRect.top + (int)(4 * g_theme.scale);
+            int sbBottom = s_contentRect.bottom - (int)(4 * g_theme.scale);
+            int sbHeight = sbBottom - sbTop;
+
+            /* Thumb height proportional to visible area */
+            float visibleRatio = (float)ch / (float)(ch + s_maxScroll);
+            if (visibleRatio > 1.0f) visibleRatio = 1.0f;
+            int thumbHeight = (int)(sbHeight * visibleRatio);
+            if (thumbHeight < (int)(20 * g_theme.scale)) thumbHeight = (int)(20 * g_theme.scale);
+
+            /* Thumb position */
+            float scrollRatio = (float)s_scrollY / (float)s_maxScroll;
+            int thumbTop = sbTop + (int)(scrollRatio * (sbHeight - thumbHeight));
+
+            RECT sbRc = { sbLeft, sbTop, sbRight, sbBottom };
+            FillRoundRect(memDC, sbRc, (int)(4 * g_theme.scale), g_theme.brSurface0);
+
+            RECT thumbRc = { sbLeft + (int)(2 * g_theme.scale), thumbTop + (int)(2 * g_theme.scale),
+                             sbRight - (int)(2 * g_theme.scale), thumbTop + thumbHeight - (int)(2 * g_theme.scale) };
+            
+            HBRUSH thumbBr = g_theme.brSurface2;
+            if (s_scrollDragging) thumbBr = g_theme.brAccent;
+            else if (s_scrollHover) thumbBr = g_theme.brText;
+            
+            FillRoundRect(memDC, thumbRc, (int)(3 * g_theme.scale), thumbBr);
+        }
+
+        /* Paint toast if visible */
+        if (s_toastVisible && s_toastFade < 5) {
+            PaintToast(memDC, s_contentRect, g_theme, s_toastFade);
+        }
+
+        /* Blit to screen */
+        BitBlt(hdc, 0, 0, cw, ch, memDC, 0, 0, SRCCOPY);
+
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    /* ---- Erase background (handled in WM_PAINT) ---- */
+    case WM_ERASEBKGND:
+        return 1;
+
+    /* ---- Mouse move ---- */
+    case WM_MOUSEMOVE: {
+        int mx = (short)LOWORD(lParam);
+        int my = (short)HIWORD(lParam);
+        
+        /* Scroll dragging */
+        if (s_scrollDragging) {
+            int deltaY = my - s_lastMouseY;
+            s_lastMouseY = my;
+
+            RECT clientRc;
+            GetClientRect(hwnd, &clientRc);
+            int ch = clientRc.bottom - clientRc.top;
+
+            int sbHeight = ch - (int)(8 * g_theme.scale);
+            float visibleRatio = (float)ch / (float)(ch + s_maxScroll);
+            if (visibleRatio > 1.0f) visibleRatio = 1.0f;
+            int thumbHeight = (int)(sbHeight * visibleRatio);
+            if (thumbHeight < (int)(20 * g_theme.scale)) thumbHeight = (int)(20 * g_theme.scale);
+
+            float scrollRatioPerPixel = (float)s_maxScroll / (float)(sbHeight - thumbHeight);
+            
+            s_scrollY += (int)(deltaY * scrollRatioPerPixel);
+            if (s_scrollY < 0) s_scrollY = 0;
+            if (s_scrollY > s_maxScroll) s_scrollY = s_maxScroll;
+
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        
+        s_lastMouseY = my;
+
+        /* Track mouse leave */
+        TRACKMOUSEEVENT tme;
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd;
+        tme.dwHoverTime = 0;
+        TrackMouseEvent(&tme);
+
+        /* Sidebar hover */
+        int newHoverTab = HitTestSidebar(s_sidebarRect, mx, my);
+        if (newHoverTab != s_hoverTab) {
+            s_hoverTab = newHoverTab;
+            InvalidateRect(hwnd, &s_sidebarRect, FALSE);
+        }
+
+        /* Content hover */
+        if (mx >= s_contentRect.left) {
+            /* Scrollbar hover hit test */
+            RECT clientRc;
+            GetClientRect(hwnd, &clientRc);
+            int sbWidth = (int)(14 * g_theme.scale);
+            int sbLeft = clientRc.right - sbWidth;
+            
+            bool newScrollHover = (mx >= sbLeft && s_maxScroll > 0);
+            if (newScrollHover != s_scrollHover) {
+                s_scrollHover = newScrollHover;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+
+            Panel& panel = s_panels[s_activeTab];
+
+            /* Slider drag */
+            if (s_dragging && s_dragWidget >= 0 && s_dragWidget < panel.count) {
+                Widget& w = panel.widgets[s_dragWidget];
+                if (w.type == WidgetType::Slider && w.intVal) {
+                    *w.intVal = SliderValueFromX(w, mx);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+                return 0;
+            }
+
+            int newHover = HitTestPanel(panel, mx, my + s_scrollY);
+            if (newHover != s_hoverWidget) {
+                /* Clear old hover */
+                if (s_hoverWidget >= 0 && s_hoverWidget < panel.count) {
+                    panel.widgets[s_hoverWidget].state = WState::Normal;
+                }
+                s_hoverWidget = newHover;
+                if (s_hoverWidget >= 0) {
+                    panel.widgets[s_hoverWidget].state = WState::Hover;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
             }
         }
-        Sleep(20);
+        return 0;
     }
-    return 0;  /* timeout — no change */
-}
 
-/* ---- Apply sliders to config ---- */
-static void ApplySliders() {
-    if (!s_config || !s_panels[2]) return;
-    HWND p = s_panels[2];
-    auto getPos = [&](int id) -> int {
-        HWND sl = GetDlgItem(p, id);
-        return sl ? (int)SendMessage(sl, TBM_GETPOS, 0, 0) : 0;
-    };
-    s_config->motion.baseSpeed       = (float)getPos(IDC_SLD_BASE);
-    s_config->motion.maxSpeed        = (float)getPos(IDC_SLD_MAX);
-    s_config->motion.accelTimeMs     = (float)getPos(IDC_SLD_ACCEL);
-    s_config->motion.decelTimeMs     = (float)getPos(IDC_SLD_DECEL);
-    s_config->motion.precisionMultiplier = getPos(IDC_SLD_PREC) / 100.0f;
-    s_config->motion.smoothingAccel  = getPos(IDC_SLD_SMOOTH) / 100.0f;
-    s_config->motion.smoothingDecel  = s_config->motion.smoothingAccel;
-    s_config->motion.tickHz          = getPos(IDC_SLD_TICK);
-    config::Validate(*s_config);
-    motion::UpdateParams(s_config->motion);
-    config::Save(*s_config);
-}
-
-/* ---- Handle remap button clicks ---- */
-static void HandleRemap(HWND hwnd, int btnId) {
-    UINT newVk = DoRemapDialog(hwnd);
-    if (newVk == 0) return;
-
-    hook::KeyBindings& k = s_config->keys;
-    switch (btnId) {
-    case IDC_BTN_UP:    k.moveUp    = newVk; break;
-    case IDC_BTN_DOWN:  k.moveDown  = newVk; break;
-    case IDC_BTN_LEFT:  k.moveLeft  = newVk; break;
-    case IDC_BTN_RIGHT: k.moveRight = newVk; break;
-    case IDC_BTN_CLKL:  k.clickLeft = newVk; break;
-    case IDC_BTN_CLKR:  k.clickRight= newVk; break;
-    case IDC_BTN_CLKM:  k.clickMiddle=newVk; break;
-    case IDC_BTN_SCRU:  k.scrollUp  = newVk; break;
-    case IDC_BTN_SCRD:  k.scrollDown= newVk; break;
-    }
-    hook::UpdateBindings(k);
-    config::Save(*s_config);
-    RefreshKeyLabels();
-}
-
-/* ================================================================ */
-static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg,
-                                        WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE:
-        /* Tab control */
-        s_tab = CreateWindowW(WC_TABCONTROLW, L"",
-            WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS,
-            0, 0, 470, 370, hwnd, (HMENU)(intptr_t)IDC_TAB, s_hInst, NULL);
-        if (s_tab) {
-            TCITEMW ti;
-            ZeroMemory(&ti, sizeof(ti));
-            ti.mask = TCIF_TEXT;
-            ti.pszText = (LPWSTR)L"General"; TabCtrl_InsertItem(s_tab, 0, &ti);
-            ti.pszText = (LPWSTR)L"Keys";    TabCtrl_InsertItem(s_tab, 1, &ti);
-            ti.pszText = (LPWSTR)L"Motion";  TabCtrl_InsertItem(s_tab, 2, &ti);
-            ti.pszText = (LPWSTR)L"Diagnostics"; TabCtrl_InsertItem(s_tab, 3, &ti);
+    /* ---- Mouse leave ---- */
+    case WM_MOUSELEAVE:
+        if (s_hoverTab >= 0) {
+            s_hoverTab = -1;
+            InvalidateRect(hwnd, &s_sidebarRect, FALSE);
         }
-        s_panels[0] = CreateGeneralPanel(hwnd);
-        s_panels[1] = CreateKeysPanel(hwnd);
-        s_panels[2] = CreateMotionPanel(hwnd);
-        s_panels[3] = CreateDiagPanel(hwnd);
-        RefreshKeyLabels();
-        RefreshSliderLabels();
-        ShowTab(0);
-        /* Diagnostics refresh timer */
-        s_diagTimer = SetTimer(hwnd, 1, 500, NULL);
+        if (s_hoverWidget >= 0) {
+            Panel& panel = s_panels[s_activeTab];
+            if (s_hoverWidget < panel.count) {
+                panel.widgets[s_hoverWidget].state = WState::Normal;
+            }
+            s_hoverWidget = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        if (s_scrollHover) {
+            s_scrollHover = false;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
 
+    /* ---- Left button down ---- */
+    case WM_LBUTTONDOWN: {
+        int mx = (short)LOWORD(lParam);
+        int my = (short)HIWORD(lParam);
+
+        /* Sidebar click */
+        int tabIdx = HitTestSidebar(s_sidebarRect, mx, my);
+        if (tabIdx >= 0 && tabIdx != s_activeTab) {
+            /* Cancel any active capture */
+            if (s_captureTarget >= 0) EndCapture(false);
+
+            s_activeTab = tabIdx;
+            s_hoverWidget = -1;
+            s_focusWidget = -1;
+            s_scrollY = 0;
+            SyncEnabledToggle();
+            LayoutPanel(s_panels[s_activeTab], s_contentRect);
+            
+            RECT clientRc;
+            GetClientRect(hwnd, &clientRc);
+            SendMessage(hwnd, WM_SIZE, 0, MAKELPARAM(clientRc.right, clientRc.bottom));
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
+        /* Content click */
+        if (mx >= s_contentRect.left) {
+            /* Check scrollbar click */
+            RECT clientRc;
+            GetClientRect(hwnd, &clientRc);
+            int ch = clientRc.bottom - clientRc.top;
+            int sbWidth = (int)(14 * g_theme.scale);
+            int sbLeft = clientRc.right - sbWidth;
+            
+            if (mx >= sbLeft && s_maxScroll > 0) {
+                int sbHeight = ch - (int)(8 * g_theme.scale);
+                float visibleRatio = (float)ch / (float)(ch + s_maxScroll);
+                if (visibleRatio > 1.0f) visibleRatio = 1.0f;
+                int thumbHeight = (int)(sbHeight * visibleRatio);
+                if (thumbHeight < (int)(20 * g_theme.scale)) thumbHeight = (int)(20 * g_theme.scale);
+
+                float scrollRatio = (float)s_scrollY / (float)s_maxScroll;
+                int thumbTop = (int)(4 * g_theme.scale) + (int)(scrollRatio * (sbHeight - thumbHeight));
+                int thumbBottom = thumbTop + thumbHeight;
+
+                if (my >= thumbTop && my <= thumbBottom) {
+                    /* Clicked on thumb */
+                    s_scrollDragging = true;
+                    s_lastMouseY = my;
+                    SetCapture(hwnd);
+                } else if (my < thumbTop) {
+                    /* Page up */
+                    s_scrollY -= ch;
+                    if (s_scrollY < 0) s_scrollY = 0;
+                } else {
+                    /* Page down */
+                    s_scrollY += ch;
+                    if (s_scrollY > s_maxScroll) s_scrollY = s_maxScroll;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+
+            Panel& panel = s_panels[s_activeTab];
+            int hit = HitTestPanel(panel, mx, my + s_scrollY);
+            if (hit < 0) return 0;
+
+            Widget& w = panel.widgets[hit];
+            s_focusWidget = hit;
+
+            switch (w.type) {
+            case WidgetType::Toggle:
+                if (w.boolVal) {
+                    *w.boolVal = !*w.boolVal;
+                    /* Special: Enabled toggle syncs to shared state */
+                    if (w.id == WID_GEN_ENABLED && s_state) {
+                        s_state->enabled.store(*w.boolVal, std::memory_order_release);
+                        if (!*w.boolVal) s_state->ClearAllKeys();
+                    }
+                    if (w.id == WID_GEN_SWALLOW) {
+                        hook::SetSwallowKeys(*w.boolVal);
+                    }
+                    AutoSave();
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                break;
+
+            case WidgetType::Slider:
+                /* Begin drag */
+                w.state = WState::Press;
+                s_dragging = true;
+                s_dragWidget = hit;
+                if (w.intVal) {
+                    *w.intVal = SliderValueFromX(w, mx);
+                }
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+                break;
+
+            case WidgetType::KeyBadge:
+                if (KeyBadgeHitRemap(w, mx, my + s_scrollY)) {
+                    /* Cancel existing capture if any */
+                    if (s_captureTarget >= 0) EndCapture(false);
+                    StartCapture(hit);
+                }
+                break;
+
+            case WidgetType::LinkButton:
+                w.state = WState::Press;
+                InvalidateRect(hwnd, NULL, FALSE);
+                break;
+
+            default:
+                break;
+            }
+        }
+        return 0;
+    }
+
+    /* ---- Left button up ---- */
+    case WM_LBUTTONUP: {
+        int mx = (short)LOWORD(lParam);
+        int my = (short)HIWORD(lParam);
+
+        if (s_scrollDragging) {
+            s_scrollDragging = false;
+            ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
+        if (s_dragging) {
+            s_dragging = false;
+            ReleaseCapture();
+            Panel& panel = s_panels[s_activeTab];
+            if (s_dragWidget >= 0 && s_dragWidget < panel.count) {
+                Widget& w = panel.widgets[s_dragWidget];
+                w.state = WState::Normal;
+                /* Save slider value */
+                SyncSlidersToConfig();
+                AutoSave();
+            }
+            s_dragWidget = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
+        /* Link button activation */
+        Panel& panel = s_panels[s_activeTab];
+        int hit = HitTestPanel(panel, mx, my + s_scrollY);
+        if (hit >= 0 && hit < panel.count) {
+            Widget& w = panel.widgets[hit];
+            if (w.type == WidgetType::LinkButton && w.state == WState::Press) {
+                w.state = WState::Normal;
+                HandleLinkAction(w.linkAction);
+            }
+        }
+        return 0;
+    }
+
+    /* ---- Double-click (slider reset to default) ---- */
+    case WM_LBUTTONDBLCLK: {
+        int mx = (short)LOWORD(lParam);
+        int my = (short)HIWORD(lParam);
+
+        Panel& panel = s_panels[s_activeTab];
+        int hit = HitTestPanel(panel, mx, my + s_scrollY);
+        if (hit >= 0 && hit < panel.count) {
+            Widget& w = panel.widgets[hit];
+            if (w.type == WidgetType::Slider && w.intVal) {
+                *w.intVal = w.sliderDefault;
+                SyncSlidersToConfig();
+                AutoSave();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+    }
+
+    /* ---- Mouse wheel ---- */
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        
+        /* High precision scrolling using accumulator */
+        s_wheelAccumulator += delta;
+        while (s_wheelAccumulator >= WHEEL_DELTA) {
+            s_scrollY -= g_theme.spacing.RowH;
+            s_wheelAccumulator -= WHEEL_DELTA;
+        }
+        while (s_wheelAccumulator <= -WHEEL_DELTA) {
+            s_scrollY += g_theme.spacing.RowH;
+            s_wheelAccumulator += WHEEL_DELTA;
+        }
+        
+        if (s_scrollY < 0) s_scrollY = 0;
+        if (s_scrollY > s_maxScroll) s_scrollY = s_maxScroll;
+        
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    /* ---- Keyboard navigation ---- */
+    case WM_KEYDOWN: {
+        int vk = (int)wParam;
+
+        /* ESC: cancel capture or close window */
+        if (vk == VK_ESCAPE) {
+            if (s_captureTarget >= 0) {
+                EndCapture(false);
+            } else {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            return 0;
+        }
+
+        /* Ctrl+R: reset all */
+        if (vk == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            HandleLinkAction(LINK_RESET_ALL);
+            return 0;
+        }
+
+        Panel& panel = s_panels[s_activeTab];
+
+        /* Tab / Shift+Tab: cycle focus */
+        if (vk == VK_TAB) {
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            int dir = shift ? -1 : 1;
+            int start = s_focusWidget;
+            int next = start;
+            for (int attempt = 0; attempt < panel.count; ++attempt) {
+                next += dir;
+                if (next >= panel.count) next = 0;
+                if (next < 0) next = panel.count - 1;
+                Widget& w = panel.widgets[next];
+                if (!w.visible) continue;
+                if (w.type == WidgetType::Toggle || w.type == WidgetType::Slider ||
+                    w.type == WidgetType::KeyBadge || w.type == WidgetType::LinkButton) {
+                    s_focusWidget = next;
+                    
+                    /* Auto-scroll to focused widget */
+                    if (w.bounds.top < s_scrollY) {
+                        s_scrollY = w.bounds.top - g_theme.spacing.LG;
+                        if (s_scrollY < 0) s_scrollY = 0;
+                    }
+                    RECT clientRc;
+                    GetClientRect(hwnd, &clientRc);
+                    int ch = clientRc.bottom;
+                    if (w.bounds.bottom > s_scrollY + ch) {
+                        s_scrollY = w.bounds.bottom - ch + g_theme.spacing.LG;
+                        if (s_scrollY > s_maxScroll) s_scrollY = s_maxScroll;
+                    }
+
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
+            }
+            return 0;
+        }
+
+        /* Arrow keys: adjust focused slider */
+        if ((vk == VK_LEFT || vk == VK_RIGHT) &&
+            s_focusWidget >= 0 && s_focusWidget < panel.count) {
+            Widget& w = panel.widgets[s_focusWidget];
+            if (w.type == WidgetType::Slider && w.intVal) {
+                int step = (vk == VK_RIGHT) ? 1 : -1;
+                int newVal = *w.intVal + step;
+                if (newVal < w.sliderMin) newVal = w.sliderMin;
+                if (newVal > w.sliderMax) newVal = w.sliderMax;
+                *w.intVal = newVal;
+                SyncSlidersToConfig();
+                AutoSave();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+
+        /* Enter/Space: activate focused widget */
+        if (vk == VK_RETURN || vk == VK_SPACE) {
+            if (s_focusWidget >= 0 && s_focusWidget < panel.count) {
+                Widget& w = panel.widgets[s_focusWidget];
+                if (w.type == WidgetType::Toggle && w.boolVal) {
+                    *w.boolVal = !*w.boolVal;
+                    if (w.id == WID_GEN_ENABLED && s_state) {
+                        s_state->enabled.store(*w.boolVal, std::memory_order_release);
+                        if (!*w.boolVal) s_state->ClearAllKeys();
+                    }
+                    if (w.id == WID_GEN_SWALLOW) {
+                        hook::SetSwallowKeys(*w.boolVal);
+                    }
+                    AutoSave();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                } else if (w.type == WidgetType::LinkButton) {
+                    HandleLinkAction(w.linkAction);
+                } else if (w.type == WidgetType::KeyBadge) {
+                    if (s_captureTarget >= 0) EndCapture(false);
+                    StartCapture(s_focusWidget);
+                }
+            }
+            return 0;
+        }
+        break;
+    }
+
+    /* ---- Key capture result from hook thread ---- */
+    case WM_APP + 10: {
+        UINT newVk = (UINT)wParam;
+        if (s_captureTarget >= 0 && keys::IsValidBindableVk(newVk)) {
+            EndCapture(true, newVk);
+            /* Refresh all key badges */
+            Panel& p = s_panels[1];
+            for (int i = 0; i < p.count; ++i) {
+                if (p.widgets[i].type == WidgetType::KeyBadge) {
+                    UpdateKeyBadgeText(p.widgets[i]);
+                }
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else {
+            EndCapture(false);
+        }
+        return 0;
+    }
+
+    /* ---- Timers ---- */
     case WM_TIMER:
-        if (wParam == 1) {
+        switch (wParam) {
+        case TIMER_DIAG:
+            if (s_activeTab == 0) SyncEnabledToggle();
             UpdateDiagnostics();
-            if (s_panels[2]) RefreshSliderLabels();
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+
+        case TIMER_TOAST: {
+            DWORD elapsed = GetTickCount() - s_toastStart;
+            if (elapsed < 1500) {
+                s_toastFade = 0;  /* visible */
+            } else {
+                s_toastFade = (int)((elapsed - 1500) / 100) + 1;
+                if (s_toastFade >= 5) {
+                    s_toastVisible = false;
+                    KillTimer(hwnd, TIMER_TOAST);
+                }
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        }
+
+        case TIMER_CAPTURE_BLINK:
+            s_captureBlink = !s_captureBlink;
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+
+        case TIMER_CAPTURE_TIMEOUT: {
+            if (s_captureTarget < 0) {
+                KillTimer(hwnd, TIMER_CAPTURE_TIMEOUT);
+                break;
+            }
+            DWORD elapsed = GetTickCount() - s_captureStart;
+            int remaining = 3 - (int)(elapsed / 1000);
+            if (remaining <= 0) {
+                EndCapture(false);
+            } else {
+                /* Update countdown text */
+                Widget& w = s_panels[1].widgets[s_captureTarget];
+                _snwprintf(w.valueText, 31, L"%ds", remaining);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        }
         }
         return 0;
 
-    case WM_NOTIFY: {
-        NMHDR* hdr = (NMHDR*)lParam;
-        if (hdr->idFrom == IDC_TAB && hdr->code == TCN_SELCHANGE) {
-            int sel = TabCtrl_GetCurSel(s_tab);
-            ShowTab(sel);
+    /* ---- Close (hide, don't destroy) ---- */
+    case WM_CLOSE: {
+        /* Save window position */
+        if (s_config) {
+            WINDOWPLACEMENT wp;
+            wp.length = sizeof(wp);
+            if (GetWindowPlacement(hwnd, &wp)) {
+                s_config->winNormL = wp.rcNormalPosition.left;
+                s_config->winNormT = wp.rcNormalPosition.top;
+                s_config->winNormR = wp.rcNormalPosition.right;
+                s_config->winNormB = wp.rcNormalPosition.bottom;
+                s_config->winShowCmd = wp.showCmd;
+                config::Save(*s_config);
+            }
         }
-        return 0;
-    }
-
-    case WM_HSCROLL:
-        /* Slider changed */
-        RefreshSliderLabels();
-        return 0;
-
-    case WM_COMMAND: {
-        int id = LOWORD(wParam);
-        if (id == IDC_CHK_ENABLED && s_state) {
-            bool chk = (SendDlgItemMessage(hwnd, IDC_CHK_ENABLED,
-                         BM_GETCHECK, 0, 0) == BST_CHECKED);
-            /* The checkbox is on the General panel, not directly on hwnd */
-            HWND ctl = GetDlgItem(s_panels[0], IDC_CHK_ENABLED);
-            if (ctl) chk = (SendMessage(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            s_state->enabled.store(chk, std::memory_order_release);
-            if (!chk) s_state->ClearAllKeys();
-        }
-        else if (id == IDC_BTN_SAVE) {
-            ApplySliders();
-        }
-        else if (id >= IDC_BTN_UP && id <= IDC_BTN_SCRD) {
-            HandleRemap(hwnd, id);
-        }
-        return 0;
-    }
-
-    case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
         return 0;
+    }
 
     case WM_DESTROY:
-        if (s_diagTimer) { KillTimer(hwnd, 1); s_diagTimer = 0; }
+        KillTimer(hwnd, TIMER_DIAG);
+        KillTimer(hwnd, TIMER_TOAST);
+        KillTimer(hwnd, TIMER_CAPTURE_BLINK);
+        KillTimer(hwnd, TIMER_CAPTURE_TIMEOUT);
         return 0;
     }
+
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -445,30 +1303,105 @@ void Init(HINSTANCE hInst, SharedState* state, AppConfig* config) {
     s_state  = state;
     s_config = config;
 
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        pfnGetDpiForWindow = (PFN_GetDpiForWindow)GetProcAddress(hUser32, "GetDpiForWindow");
+        pfnAdjustWindowRectExForDpi = (PFN_AdjustWindowRectExForDpi)GetProcAddress(hUser32, "AdjustWindowRectExForDpi");
+    }
+
+    /* Initialize theme (fonts + brushes) with initial DPI */
+    HDC screen = GetDC(NULL);
+    int initialDpi = GetDeviceCaps(screen, LOGPIXELSX);
+    ReleaseDC(NULL, screen);
+    g_theme.Init(initialDpi);
+
+    /* Load DwmSetWindowAttribute dynamically */
+    HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
+    if (hDwm) {
+        pfnDwmSetWindowAttribute = (PFN_DwmSetWindowAttribute)
+            GetProcAddress(hDwm, "DwmSetWindowAttribute");
+    }
+
+    /* Register the settings window class */
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc   = SettingsWndProc;
     wc.hInstance      = hInst;
+    wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(101));
+    wc.hIconSm       = LoadIconW(hInst, MAKEINTRESOURCEW(101));
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = NULL;  /* we paint everything ourselves */
     wc.lpszClassName = s_wndClass;
     RegisterClassExW(&wc);
 }
 
 void Show() {
     if (!s_hwnd) {
-        s_hwnd = CreateWindowExW(0, s_wndClass, L"CursorMove Settings",
-            WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,
-            CW_USEDEFAULT, CW_USEDEFAULT, 485, 410,
+        /* Determine position */
+        int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+        int w = (int)(WIN_W * g_theme.scale);
+        int h = (int)(WIN_H * g_theme.scale);
+        
+        DWORD dwStyle = WS_OVERLAPPEDWINDOW;
+        
+        if (s_config && s_config->winNormL != -1) {
+            x = s_config->winNormL;
+            y = s_config->winNormT;
+            w = s_config->winNormR - s_config->winNormL;
+            h = s_config->winNormB - s_config->winNormT;
+
+            /* Validate position is on-screen */
+            RECT testRc = { x, y, x + w, y + h };
+            HMONITOR hMon = MonitorFromRect(&testRc, MONITOR_DEFAULTTONULL);
+            if (!hMon) {
+                x = CW_USEDEFAULT;
+                y = CW_USEDEFAULT;
+                w = (int)(WIN_W * g_theme.scale);
+                h = (int)(WIN_H * g_theme.scale);
+            }
+        }
+        
+        if (x == (int)CW_USEDEFAULT && pfnAdjustWindowRectExForDpi) {
+            RECT calcRc = { 0, 0, w, h };
+            pfnAdjustWindowRectExForDpi(&calcRc, dwStyle, FALSE, 0, g_theme.currentDpi);
+            w = calcRc.right - calcRc.left;
+            h = calcRc.bottom - calcRc.top;
+        }
+
+        s_hwnd = CreateWindowExW(
+            0, s_wndClass, L"CursorMove Settings",
+            dwStyle,
+            x, y, w, h,
             NULL, NULL, s_hInst, NULL);
+
+        /* Set dark title bar BEFORE first ShowWindow */
+        if (s_hwnd && pfnDwmSetWindowAttribute) {
+            BOOL dark = TRUE;
+            pfnDwmSetWindowAttribute(s_hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+        }
     }
+
     if (s_hwnd) {
-        ShowWindow(s_hwnd, SW_SHOW);
+        /* Refresh state */
+        SyncEnabledToggle();
+        SyncSlidersFromConfig();
+        BuildAllPanels();
+        LayoutPanel(s_panels[s_activeTab], s_contentRect);
+
+        if (s_config && s_config->winNormL != -1) {
+            WINDOWPLACEMENT wp;
+            wp.length = sizeof(wp);
+            wp.flags = 0;
+            wp.showCmd = s_config->winShowCmd == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+            wp.rcNormalPosition = { s_config->winNormL, s_config->winNormT, s_config->winNormR, s_config->winNormB };
+            SetWindowPlacement(s_hwnd, &wp);
+        } else {
+            ShowWindow(s_hwnd, SW_SHOW);
+        }
         SetForegroundWindow(s_hwnd);
-        RefreshKeyLabels();
-        RefreshSliderLabels();
-        UpdateDiagnostics();
     }
 }
 
@@ -481,10 +1414,16 @@ bool IsVisible() {
 }
 
 void Destroy() {
-    if (s_hwnd) { DestroyWindow(s_hwnd); s_hwnd = NULL; }
+    if (s_hwnd) {
+        DestroyWindow(s_hwnd);
+        s_hwnd = NULL;
+    }
+    g_theme.Destroy();
 }
 
-HWND GetHwnd() { return s_hwnd; }
+HWND GetHwnd() {
+    return s_hwnd;
+}
 
 } /* namespace ui */
 } /* namespace cm */

@@ -151,6 +151,7 @@ int WINAPI WinMain(HINSTANCE hInstance,
     } else {
         /* Apply configured key bindings */
         cm::hook::UpdateBindings(g_config.keys);
+        cm::hook::SetSwallowKeys(g_config.swallowKeys);
     }
 
     /* ---- Initialize settings UI ---- */
